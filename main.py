@@ -33,18 +33,20 @@ CSV_PATH   = DATA_DIR / "datos_sensor.csv"
 MODEL_PATH = MODELS_DIR / "modelo_sensores.pkl"
 
 # ──────────────── Datos de respaldo ────────────────
-# Si no existe el CSV, genera uno mínimo para que el dashboard funcione
+# Si no existe el CSV, genera uno mínimo para que el dashboard funcione.
+# Mismos parámetros y semilla que train_model.py (propios del grupo, distintos
+# a los del proyecto base).
 if not CSV_PATH.exists():
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(123)
     normal = pd.DataFrame({
-        "temperatura": rng.normal(70, 5, 300),
-        "vibracion":   rng.normal(0.5, 0.1, 300),
-        "retraso": 0,
+        "temperatura": rng.normal(68, 5, 300),
+        "vibracion":   rng.normal(0.55, 0.12, 300),
+        "falla": 0,
     })
     falla = pd.DataFrame({
-        "temperatura": rng.normal(85, 5, 60),
-        "vibracion":   rng.normal(0.9, 0.1, 60),
-        "retraso": 1,
+        "temperatura": rng.normal(80, 6, 50),
+        "vibracion":   rng.normal(0.85, 0.15, 50),
+        "falla": 1,
     })
     df0 = pd.concat([normal, falla], ignore_index=True)
     df0.to_csv(CSV_PATH, index=False)
@@ -56,11 +58,11 @@ if not MODEL_PATH.exists():
 
     df = pd.read_csv(CSV_PATH)
     X = df[["temperatura", "vibracion"]]
-    y = df["retraso"]
+    y = df["falla"]
     Xtr, Xte, ytr, yte = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
+        X, y, test_size=0.3, random_state=123, stratify=y
     )
-    clf = RandomForestClassifier(random_state=42).fit(Xtr, ytr)
+    clf = RandomForestClassifier(random_state=123).fit(Xtr, ytr)
     joblib.dump(clf, MODEL_PATH)
 
 modelo = joblib.load(MODEL_PATH)
@@ -102,7 +104,7 @@ def predict(temperatura: float, vibracion: float):
     )
     proba = float(modelo.predict_proba(X)[0][1])
     pred = int(proba >= 0.5)
-    return {"prediccion": pred, "prob_retraso": round(proba, 4)}
+    return {"prediccion": pred, "prob_falla": round(proba, 4)}
 
 
 @app.post("/monitor")
@@ -151,23 +153,43 @@ def make_dashboard():
 
     def _predecir_ui(t, v):
         r = predict(temperatura=t, vibracion=v)
-        etiqueta = "⚠️ Retraso" if r["prediccion"] == 1 else "✅ Sin retraso"
-        return f"{etiqueta}  (prob = {r['prob_retraso']})"
+        return {"⚠️ Falla": r["prob_falla"], "✅ Sin falla": round(1 - r["prob_falla"], 4)}
+
+    def _overlay(ref_col, curr_col, upper, titulo):
+        """Histograma superpuesto referencia vs. batch actual, con el límite k·σ marcado."""
+        fig = px.histogram(
+            pd.DataFrame({
+                "valor": pd.concat([ref_col, curr_col], ignore_index=True),
+                "origen": ["Referencia"] * len(ref_col) + ["Batch actual"] * len(curr_col),
+            }),
+            x="valor", color="origen", barmode="overlay", histnorm="probability density",
+            opacity=0.6, title=titulo,
+        )
+        fig.add_vline(x=upper, line_dash="dash", line_color="red",
+                       annotation_text="límite k·σ", annotation_position="top")
+        return fig
 
     def _monitor_ui(sz, tm, ts, vm, vs):
         r = monitor(sz, tm, ts, vm, vs)
         a = r["alerts"]
-        return (
-            f"Temp alerta: {a['temp']} | Vib alerta: {a['vib']}\n"
-            f"Límites: {r['limits']}\n"
-            f"Medias actuales: {r['current_means']}"
+        resumen = (
+            f"{'🔴' if a['temp'] else '🟢'} Temperatura — media batch: {r['current_means']['temp']} "
+            f"(límite: {r['limits']['temp_upper']})\n"
+            f"{'🔴' if a['vib'] else '🟢'} Vibración — media batch: {r['current_means']['vib']} "
+            f"(límite: {r['limits']['vib_upper']})"
         )
 
-    def _graficos():
-        df = pd.read_csv(CSV_PATH)
-        f1 = px.histogram(df, x="temperatura", nbins=40, title="Distribución – Temperatura")
-        f2 = px.histogram(df, x="vibracion",   nbins=40, title="Distribución – Vibración")
-        return f1, f2
+        ref = pd.read_csv(CSV_PATH)
+        rng = np.random.default_rng(7)  # misma semilla que usa /monitor internamente
+        curr = pd.DataFrame({
+            "temperatura": rng.normal(tm, ts, sz),
+            "vibracion":   rng.normal(vm, vs, sz),
+        })
+        fig_t = _overlay(ref["temperatura"], curr["temperatura"], r["limits"]["temp_upper"],
+                          "Temperatura: referencia vs. batch actual")
+        fig_v = _overlay(ref["vibracion"], curr["vibracion"], r["limits"]["vib_upper"],
+                          "Vibración: referencia vs. batch actual")
+        return resumen, fig_t, fig_v
 
     with gr.Blocks(title="Panel de Sensores", analytics_enabled=False) as demo:
         gr.Markdown("## 🏭 Panel de Sensores Industriales")
@@ -177,7 +199,7 @@ def make_dashboard():
                 gr.Markdown("### Predicción individual")
                 temperatura = gr.Slider(50, 110, value=75, step=1, label="Temperatura")
                 vibracion   = gr.Slider(0.2, 1.5, value=0.8, step=0.01, label="Vibración")
-                salida_pred = gr.Textbox(label="Resultado")
+                salida_pred = gr.Label(label="Resultado", num_top_classes=2)
                 gr.Button("Predecir").click(
                     _predecir_ui,
                     inputs=[temperatura, vibracion],
@@ -185,24 +207,21 @@ def make_dashboard():
                 )
 
             with gr.Column():
-                gr.Markdown("### Monitoreo de drift")
+                gr.Markdown("### Monitoreo de drift (±2σ sobre la referencia)")
                 size   = gr.Slider(50, 1000, value=200, step=10, label="Tamaño batch")
                 t_mean = gr.Slider(60, 110,  value=90,  step=1,  label="Temp. media batch")
                 t_std  = gr.Slider(1, 10,    value=5,   step=0.5, label="Temp. std batch")
                 v_mean = gr.Slider(0.3, 1.5, value=1.0, step=0.05, label="Vib. media batch")
                 v_std  = gr.Slider(0.05, 0.5, value=0.1, step=0.01, label="Vib. std batch")
                 salida_mon = gr.Textbox(label="Resumen drift")
-                gr.Button("Calcular drift").click(
-                    _monitor_ui,
-                    inputs=[size, t_mean, t_std, v_mean, v_std],
-                    outputs=salida_mon,
-                )
 
-        gr.Markdown("## 📊 Distribuciones históricas")
+        gr.Markdown("## 📊 Referencia vs. batch actual")
         fig_t = gr.Plot()
         fig_v = gr.Plot()
-        demo.load(_graficos, None, [fig_t, fig_v])
-        gr.Button("Actualizar gráficos").click(_graficos, None, [fig_t, fig_v])
+        inputs_monitor = [size, t_mean, t_std, v_mean, v_std]
+        outputs_monitor = [salida_mon, fig_t, fig_v]
+        gr.Button("Calcular drift").click(_monitor_ui, inputs=inputs_monitor, outputs=outputs_monitor)
+        demo.load(_monitor_ui, inputs_monitor, outputs_monitor)
 
     return demo
 

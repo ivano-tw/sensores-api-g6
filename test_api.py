@@ -31,7 +31,7 @@ def test_predict_normal():
     print(f"   Status: {r.status_code}")
     print(f"   Body:   {r.json()}")
     assert r.status_code == 200
-    assert r.json()["prediccion"] == 0  # no debería haber retraso
+    assert r.json()["prediccion"] == 0  # no debería haber falla
 
 
 def test_predict_falla():
@@ -41,7 +41,7 @@ def test_predict_falla():
     print(f"   Status: {r.status_code}")
     print(f"   Body:   {r.json()}")
     assert r.status_code == 200
-    assert r.json()["prediccion"] == 1  # se espera retraso
+    assert r.json()["prediccion"] == 1  # se espera falla
 
 
 def test_monitor():
